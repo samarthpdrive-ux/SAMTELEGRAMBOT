@@ -1,0 +1,645 @@
+"""
+services/deposit_checker.py
+
+USDT Deposit Checker
+
+Supports:
+- BEP20 (BSC)
+- Polygon
+
+Verification:
+- Etherscan V2 API
+- Receipt parsing
+- Duplicate protection
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Optional, Union
+
+import requests
+
+from database import SessionLocal
+from models.deposit import Deposit
+from models.user import User
+
+import config
+
+logger = logging.getLogger(__name__)
+
+# =====================================================
+# SETTINGS
+# =====================================================
+
+ETHERSCAN_URL = "https://api.etherscan.io/v2/api"
+
+CHECK_INTERVAL = 15
+
+HTTP_TIMEOUT = 20
+
+API_KEY = getattr(config, "ETHERSCAN_API_KEY", "")
+
+# =====================================================
+# YOUR WALLETS
+# =====================================================
+
+BEP20_ADDRESS = getattr(config, "BEP20_ADDRESS", "").lower()
+
+POLYGON_ADDRESS = getattr(config, "POLYGON_ADDRESS", "").lower()
+
+# =====================================================
+# USDT CONTRACTS
+# =====================================================
+
+USDT_BSC = "0x55d398326f99059ff775485246999027b3197955".lower()
+
+USDT_POLYGON = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f".lower()
+
+TRANSFER_TOPIC = (
+    "0xddf252ad"
+    "1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+)
+
+# =====================================================
+# CHAIN CONFIG
+# =====================================================
+
+@dataclass
+class Chain:
+
+    name: str
+
+    chainid: int
+
+    wallet: str
+
+    contract: str
+
+    decimals: int
+
+
+CHAINS = {
+
+    "BEP20": Chain(
+        "BEP20",
+        56,
+        BEP20_ADDRESS,
+        USDT_BSC,
+        18,
+    ),
+
+    "POLYGON": Chain(
+        "POLYGON",
+        137,
+        POLYGON_ADDRESS,
+        USDT_POLYGON,
+        6,
+    ),
+}
+
+# =====================================================
+# HELPERS
+# =====================================================
+
+def valid_hash(tx_hash: str) -> bool:
+    """Validate transaction hash format."""
+    if tx_hash is None:
+        return False
+    if not isinstance(tx_hash, str):
+        return False
+    return (
+        tx_hash.startswith("0x")
+        and len(tx_hash) == 66
+    )
+
+
+def raw_to_amount(value: int, decimals: int) -> Decimal:
+    """Convert raw integer amount to Decimal."""
+    return Decimal(value) / Decimal(10 ** decimals)
+
+
+async def etherscan_receipt(
+    chain: Chain,
+    tx_hash: str,
+) -> Optional[dict]:
+    """Fetch transaction receipt from Etherscan V2 API."""
+
+    params = {
+        "chainid": chain.chainid,
+        "module": "proxy",
+        "action": "eth_getTransactionReceipt",
+        "txhash": tx_hash,
+        "apikey": API_KEY,
+    }
+
+    try:
+        response = await asyncio.to_thread(
+            requests.get,
+            ETHERSCAN_URL,
+            params=params,
+            timeout=HTTP_TIMEOUT,
+            headers={
+                "Accept": "application/json"
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    except Exception as e:
+        logger.error(
+            "[%s] API Error for tx %s: %s",
+            chain.name,
+            tx_hash,
+            e,
+        )
+        return None
+
+    # Check for API error
+    if data.get("status") == "0":
+        logger.error(
+            "[%s] API returned error: %s",
+            chain.name,
+            data.get("message", "Unknown error"),
+        )
+        return None
+
+    result = data.get("result")
+
+    if result is None:
+        return None
+
+    if isinstance(result, dict):
+        return result
+
+    return None
+
+
+# =====================================================
+# RECEIPT PARSER
+# =====================================================
+
+def _decode_address(topic: str) -> str:
+    """
+    Converts a 32-byte indexed topic into an Ethereum address.
+    """
+    if not topic:
+        return ""
+
+    topic = topic.lower().replace("0x", "")
+
+    return "0x" + topic[-40:]
+
+
+def _decode_uint(hex_value: str) -> int:
+    """
+    Converts hex string data into integer.
+    """
+    if not hex_value:
+        return 0
+
+    return int(hex_value, 16)
+
+
+def parse_transfer(chain: Chain, receipt: dict) -> Optional[dict]:
+    """
+    Search receipt logs for a valid USDT Transfer event
+    directed to our wallet.
+    """
+
+    logs = receipt.get("logs", [])
+
+    for log in logs:
+
+        # Must be USDT contract
+        contract = log.get("address", "").lower()
+
+        if contract != chain.contract:
+            continue
+
+        topics = log.get("topics", [])
+
+        if len(topics) < 3:
+            continue
+
+        # ERC20 Transfer signature
+        if not topics[0].lower().startswith(TRANSFER_TOPIC):
+            continue
+
+        sender = _decode_address(topics[1])
+
+        receiver = _decode_address(topics[2])
+
+        # Must be our wallet
+        if receiver.lower() != chain.wallet:
+            continue
+
+        amount_raw = _decode_uint(log.get("data", "0x0"))
+
+        amount = raw_to_amount(
+            amount_raw,
+            chain.decimals,
+        )
+
+        return {
+            "sender": sender,
+            "receiver": receiver,
+            "amount": amount,
+            "contract": contract,
+        }
+
+    return None
+
+
+# =====================================================
+# RECEIPT VALIDATION
+# =====================================================
+
+async def verify_transaction(
+    chain: Chain,
+    tx_hash: str,
+) -> Optional[Union[dict, bool]]:
+    """
+    Verify a transaction using the Etherscan V2 API.
+
+    Returns:
+        None  -> not confirmed yet (API unavailable or tx not indexed)
+        False -> transaction failed or no valid USDT transfer
+        dict  -> confirmed transfer details
+    """
+
+    receipt = await etherscan_receipt(
+        chain,
+        tx_hash,
+    )
+
+    if receipt is None:
+        return None
+
+    status = receipt.get("status")
+
+    # Transaction failed
+    if status != "0x1":
+        logger.info(
+            "[%s] %s failed",
+            chain.name,
+            tx_hash,
+        )
+        return False
+
+    transfer = parse_transfer(
+        chain,
+        receipt,
+    )
+
+    if transfer is None:
+        logger.info(
+            "[%s] %s has no valid USDT transfer",
+            chain.name,
+            tx_hash,
+        )
+        return False
+
+    transfer["receipt"] = receipt
+
+    return transfer
+
+
+# =====================================================
+# DATABASE HELPERS
+# =====================================================
+
+def tx_already_processed(tx_hash: str) -> bool:
+    """
+    Returns True if another completed deposit already
+    used this transaction hash.
+    """
+
+    db = SessionLocal()
+
+    try:
+        dep = (
+            db.query(Deposit)
+            .filter(
+                Deposit.tx_hash == tx_hash,
+                Deposit.status == "completed",
+            )
+            .first()
+        )
+
+        return dep is not None
+
+    finally:
+        db.close()
+
+
+def credit_user(
+    db,
+    deposit: Deposit,
+    amount: Decimal,
+) -> bool:
+    """
+    Credits the user's balance.
+    """
+
+    user = (
+        db.query(User)
+        .filter(User.telegram_id == deposit.telegram_id)
+        .first()
+    )
+
+    if user is None:
+        logger.error(
+            "User %s not found",
+            deposit.telegram_id,
+        )
+        return False
+
+    user.balance += float(amount)
+
+    if hasattr(user, "total_deposit"):
+        user.total_deposit += float(amount)
+
+    deposit.amount = float(amount)
+    deposit.status = "completed"
+
+    db.commit()
+
+    logger.info(
+        "Deposit credited | User=%s Amount=%s",
+        user.telegram_id,
+        amount,
+    )
+
+    return True
+
+
+# =====================================================
+# VERIFY ONE DEPOSIT
+# =====================================================
+
+async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
+    """
+    Verify a deposit by Deposit object or deposit ID.
+
+    Args:
+        deposit_or_id: Either a Deposit object or an integer deposit ID.
+
+    Returns:
+        True  -> deposit verified and credited successfully
+        False -> deposit failed or invalid
+        None  -> deposit still pending (API unavailable or tx not indexed yet)
+    """
+
+    # â”€â”€ Allow caller to pass an integer deposit ID â”€â”€
+    db = None
+    deposit = None
+
+    if isinstance(deposit_or_id, int):
+        db = SessionLocal()
+        try:
+            deposit = db.get(Deposit, deposit_or_id)
+            if deposit is None:
+                logger.error("Deposit %s not found", deposit_or_id)
+                return False
+        finally:
+            if deposit is None:
+                db.close()
+                return False
+    else:
+        deposit = deposit_or_id
+
+    try:
+        # Validation
+        if not isinstance(deposit.tx_hash, str):
+            logger.error(
+                "Deposit %s has invalid tx_hash type: %s",
+                deposit.id,
+                type(deposit.tx_hash),
+            )
+            return False
+
+        if not valid_hash(deposit.tx_hash):
+            logger.error(
+                "Deposit %s has invalid tx_hash: %s",
+                deposit.id,
+                deposit.tx_hash,
+            )
+            return False
+
+        network = deposit.network.upper() if deposit.network else ""
+
+        if network not in CHAINS:
+            logger.error(
+                "Unknown network '%s' for deposit %s",
+                network,
+                deposit.id,
+            )
+            return False
+
+        chain = CHAINS[network]
+
+        verification = await verify_transaction(
+            chain,
+            deposit.tx_hash,
+        )
+
+        # API unavailable or tx not indexed yet
+        if verification is None:
+            return None
+
+        # Invalid transaction
+        if verification is False:
+            if db is None:
+                db = SessionLocal()
+            try:
+                dep = db.get(Deposit, deposit.id)
+                if dep:
+                    dep.status = "failed"
+                    db.commit()
+            except Exception:
+                db.rollback()
+            finally:
+                if isinstance(deposit_or_id, int):
+                    db.close()
+            return False
+
+        # Transaction is valid
+        if db is None:
+            db = SessionLocal()
+
+        try:
+            dep = db.get(Deposit, deposit.id)
+
+            if dep is None:
+                return False
+
+            # Duplicate completed transaction
+            duplicate = (
+                db.query(Deposit)
+                .filter(
+                    Deposit.tx_hash == dep.tx_hash,
+                    Deposit.status == "completed",
+                    Deposit.id != dep.id,
+                )
+                .first()
+            )
+
+            if duplicate:
+                dep.status = "failed"
+                db.commit()
+
+                logger.warning(
+                    "Duplicate tx %s for deposit %s",
+                    dep.tx_hash,
+                    dep.id,
+                )
+                return False
+
+            credited = credit_user(
+                db,
+                dep,
+                verification["amount"],
+            )
+
+            return credited
+
+        except Exception as e:
+            db.rollback()
+            logger.exception(
+                "Error crediting deposit %s: %s",
+                deposit.id,
+                e,
+            )
+            return False
+
+        finally:
+            if isinstance(deposit_or_id, int) or db is not None:
+                db.close()
+
+    except AttributeError as e:
+        logger.exception(
+            "AttributeError verifying deposit %s: %s",
+            getattr(deposit, 'id', 'unknown'),
+            e,
+        )
+        if db:
+            try:
+                dep = db.get(Deposit, deposit.id)
+                if dep:
+                    dep.status = "failed"
+                    db.commit()
+            except Exception:
+                db.rollback()
+        return False
+
+    finally:
+        # Only close if we opened it here AND it's not already closed
+        if isinstance(deposit_or_id, int) and db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+# =====================================================
+# CHECK PENDING DEPOSITS
+# =====================================================
+
+async def check_pending_deposits():
+    """
+    Scan all pending deposits and verify them.
+    """
+
+    db = SessionLocal()
+
+    try:
+        deposits = (
+            db.query(Deposit)
+            .filter(Deposit.status == "pending")
+            .all()
+        )
+
+        logger.info(
+            "Checking %s pending deposits...",
+            len(deposits),
+        )
+
+    finally:
+        db.close()
+
+    for deposit in deposits:
+        try:
+            await verify_deposit(deposit)
+
+        except Exception:
+            logger.exception(
+                "Failed checking deposit %s",
+                deposit.id,
+            )
+
+
+# =====================================================
+# CHECK SINGLE TRANSACTION
+# =====================================================
+
+async def check_single_transaction(tx_hash: str, network: str) -> Optional[Union[dict, bool]]:
+    """
+    Helper that verifies one transaction without the
+    background loop.
+
+    Returns:
+        None  -> not confirmed yet
+        False -> invalid/failed transaction
+        dict  -> confirmed transfer details
+    """
+
+    network = network.upper()
+
+    if network not in CHAINS:
+        return None
+
+    return await verify_transaction(
+        CHAINS[network],
+        tx_hash,
+    )
+
+
+# =====================================================
+# BACKGROUND LOOP
+# =====================================================
+
+async def deposit_checker_loop():
+
+    logger.info("--------------------------------")
+    logger.info("Deposit checker started")
+    logger.info("--------------------------------")
+
+    while True:
+        try:
+            await check_pending_deposits()
+
+        except Exception:
+            logger.exception(
+                "Deposit checker crashed"
+            )
+
+        await asyncio.sleep(CHECK_INTERVAL)
+
+
+# =====================================================
+# STARTER
+# =====================================================
+
+def start_checker():
+    """
+    Creates the background task.
+    Call once during bot startup.
+    """
+
+    return asyncio.create_task(
+        deposit_checker_loop()
+    )
