@@ -14,19 +14,16 @@ DATABASE_URL = (
     f"{MYSQL_DB}"
 )
 
-print("Database Host:", MYSQL_HOST)
-print("Database Port:", MYSQL_PORT)
-print("Database Name:", MYSQL_DB)
-print("Database User:", MYSQL_USER)
-
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=3600,
     echo=False,
     connect_args={
-        "ssl": {}
-    }
+        "ssl_ca": "ca.pem",
+        "ssl_verify_cert": True,
+        "ssl_verify_identity": True,
+    },
 )
 
 SessionLocal = sessionmaker(
