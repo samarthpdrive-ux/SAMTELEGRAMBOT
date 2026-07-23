@@ -14,21 +14,26 @@ DATABASE_URL = (
     f"{MYSQL_DB}"
 )
 
-print("Encoded Password:", encoded_password)
-print("Database URL:", DATABASE_URL)
+print("Database Host:", MYSQL_HOST)
+print("Database Port:", MYSQL_PORT)
+print("Database Name:", MYSQL_DB)
+print("Database User:", MYSQL_USER)
 
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
     pool_recycle=3600,
-    echo=False
+    echo=False,
+    connect_args={
+        "ssl": {}
+    }
 )
 
 SessionLocal = sessionmaker(
     bind=engine,
     autocommit=False,
     autoflush=False,
-    expire_on_commit=False  # IMPORTANT
+    expire_on_commit=False
 )
 
 Base = declarative_base()
