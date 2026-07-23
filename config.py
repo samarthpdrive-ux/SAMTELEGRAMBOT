@@ -1,11 +1,10 @@
 BOT_TOKEN = "8625419072:AAGVUi2zX05h-TNwJYavXWhU0YSP6GNRKbU"
 
-MYSQL_USER = "telegram"
-MYSQL_PASSWORD = "telegram123"
-MYSQL_HOST = "127.0.0.1"
-MYSQL_PORT = 3306
+MYSQL_USER = "2ewpv52LDgvq7sn.root"
+MYSQL_PASSWORD = "DygzaBiS7FtcfKzX"
+MYSQL_HOST = "gateway01.ap-southeast-1.prod.aws.tidbcloud.com"
+MYSQL_PORT = 4000
 MYSQL_DB = "telegram_shop"
-
 
 ADMIN_IDS = [
     7943742895
