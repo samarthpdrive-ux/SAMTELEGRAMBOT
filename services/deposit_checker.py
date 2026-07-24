@@ -12,8 +12,8 @@ Verification:
 - Receipt parsing
 - Duplicate protection
 
-FIX NOTES (see chat for context):
-- Invalid tx_hash / unknown network deposits are now marked "failed"
+FIX NOTES:
+- Invalid tx_hash / unknown network deposits are marked "failed"
   immediately instead of being left "pending" forever. Previously,
   a deposit created with a bad tx_hash (e.g. a stray menu-button
   label like "📦 Manage Products" instead of a real hash) would sit
@@ -21,9 +21,11 @@ FIX NOTES (see chat for context):
   CHECK_INTERVAL seconds forever, spamming logs indefinitely. Now it
   self-terminates into "failed" on the first check.
 - The real root cause (a bot input handler saving arbitrary text as
-  tx_hash when the user leaves the deposit flow) lives outside this
-  file and should also be fixed there — validate/cancel before ever
-  creating the Deposit row.
+  tx_hash when the user leaves the deposit flow) should ALSO be fixed
+  in handlers/deposit.py — validate the tx_hash format there before
+  ever writing it to the Deposit row.
+- verify_deposit() was rewritten for clearer, single-path session
+  handling (one DB session per call, always closed exactly once).
 """
 
 from __future__ import annotations
@@ -171,7 +173,6 @@ async def etherscan_receipt(
         )
         return None
 
-    # Check for API error
     if data.get("status") == "0":
         logger.error(
             "[%s] API returned error: %s",
@@ -196,9 +197,7 @@ async def etherscan_receipt(
 # =====================================================
 
 def _decode_address(topic: str) -> str:
-    """
-    Converts a 32-byte indexed topic into an Ethereum address.
-    """
+    """Converts a 32-byte indexed topic into an Ethereum address."""
     if not topic:
         return ""
 
@@ -208,9 +207,7 @@ def _decode_address(topic: str) -> str:
 
 
 def _decode_uint(hex_value: str) -> int:
-    """
-    Converts hex string data into integer.
-    """
+    """Converts hex string data into integer."""
     if not hex_value:
         return 0
 
@@ -227,7 +224,6 @@ def parse_transfer(chain: Chain, receipt: dict) -> Optional[dict]:
 
     for log in logs:
 
-        # Must be USDT contract
         contract = log.get("address", "").lower()
 
         if contract != chain.contract:
@@ -238,7 +234,6 @@ def parse_transfer(chain: Chain, receipt: dict) -> Optional[dict]:
         if len(topics) < 3:
             continue
 
-        # ERC20 Transfer signature
         if not topics[0].lower().startswith(TRANSFER_TOPIC):
             continue
 
@@ -246,7 +241,6 @@ def parse_transfer(chain: Chain, receipt: dict) -> Optional[dict]:
 
         receiver = _decode_address(topics[2])
 
-        # Must be our wallet
         if receiver.lower() != chain.wallet:
             continue
 
@@ -294,7 +288,6 @@ async def verify_transaction(
 
     status = receipt.get("status")
 
-    # Transaction failed
     if status != "0x1":
         logger.info(
             "[%s] %s failed",
@@ -354,9 +347,7 @@ def credit_user(
     deposit: Deposit,
     amount: Decimal,
 ) -> bool:
-    """
-    Credits the user's balance.
-    """
+    """Credits the user's balance."""
 
     user = (
         db.query(User)
@@ -430,6 +421,19 @@ def mark_deposit_failed(deposit_id: int, reason: str) -> None:
         db.close()
 
 
+def _fail_deposit(db, deposit_id: int, reason: str) -> None:
+    """Mark a deposit failed using an already-open session."""
+    try:
+        dep = db.get(Deposit, deposit_id)
+        if dep and dep.status not in ("completed", "failed"):
+            dep.status = "failed"
+            db.commit()
+            logger.warning("Deposit %s auto-failed: %s", deposit_id, reason)
+    except Exception:
+        db.rollback()
+        logger.exception("Could not auto-fail deposit %s", deposit_id)
+
+
 # =====================================================
 # VERIFY ONE DEPOSIT
 # =====================================================
@@ -438,43 +442,40 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
     """
     Verify a deposit by Deposit object or deposit ID.
 
-    Args:
-        deposit_or_id: Either a Deposit object or an integer deposit ID.
-
     Returns:
         True  -> deposit verified and credited successfully
         False -> deposit failed or invalid
         None  -> deposit still pending (API unavailable or tx not indexed yet)
     """
 
-    # ── Allow caller to pass an integer deposit ID ──
-    db = None
-    deposit = None
-
-    if isinstance(deposit_or_id, int):
-        db = SessionLocal()
-        try:
-            deposit = db.get(Deposit, deposit_or_id)
-            if deposit is None:
-                logger.error("Deposit %s not found", deposit_or_id)
-                return False
-        finally:
-            if deposit is None:
-                db.close()
-                return False
-    else:
-        deposit = deposit_or_id
+    db = SessionLocal()
 
     try:
-        # Validation
+        # ── Resolve the deposit row in THIS session ──
+        if isinstance(deposit_or_id, int):
+            deposit_id = deposit_or_id
+        else:
+            deposit_id = deposit_or_id.id
+
+        deposit = db.get(Deposit, deposit_id)
+
+        if deposit is None:
+            logger.error("Deposit %s not found", deposit_id)
+            return False
+
+        if deposit.status in ("completed", "failed"):
+            # Already resolved (e.g. by a concurrent check) — nothing to do.
+            return deposit.status == "completed"
+
+        # ── Validate tx_hash ──
         if not isinstance(deposit.tx_hash, str):
             logger.error(
                 "Deposit %s has invalid tx_hash type: %s",
                 deposit.id,
                 type(deposit.tx_hash),
             )
-            mark_deposit_failed(
-                deposit.id,
+            _fail_deposit(
+                db, deposit.id,
                 f"tx_hash not a string (got {type(deposit.tx_hash).__name__})",
             )
             return False
@@ -485,12 +486,13 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
                 deposit.id,
                 deposit.tx_hash,
             )
-            mark_deposit_failed(
-                deposit.id,
+            _fail_deposit(
+                db, deposit.id,
                 f"tx_hash failed format check: {deposit.tx_hash!r}",
             )
             return False
 
+        # ── Validate network ──
         network = deposit.network.upper() if deposit.network else ""
 
         if network not in CHAINS:
@@ -499,115 +501,57 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
                 network,
                 deposit.id,
             )
-            mark_deposit_failed(
-                deposit.id,
-                f"unknown network {network!r}",
-            )
+            _fail_deposit(db, deposit.id, f"unknown network {network!r}")
             return False
 
         chain = CHAINS[network]
 
-        verification = await verify_transaction(
-            chain,
-            deposit.tx_hash,
-        )
+        # ── Ask Etherscan ──
+        verification = await verify_transaction(chain, deposit.tx_hash)
 
-        # API unavailable or tx not indexed yet
         if verification is None:
+            # Not confirmed / indexed yet — leave as pending, try again later.
             return None
 
-        # Invalid transaction
         if verification is False:
-            if db is None:
-                db = SessionLocal()
-            try:
-                dep = db.get(Deposit, deposit.id)
-                if dep:
-                    dep.status = "failed"
-                    db.commit()
-            except Exception:
-                db.rollback()
-            finally:
-                if isinstance(deposit_or_id, int):
-                    db.close()
+            deposit.status = "failed"
+            db.commit()
             return False
 
-        # Transaction is valid
-        if db is None:
-            db = SessionLocal()
-
-        try:
-            dep = db.get(Deposit, deposit.id)
-
-            if dep is None:
-                return False
-
-            # Duplicate completed transaction
-            duplicate = (
-                db.query(Deposit)
-                .filter(
-                    Deposit.tx_hash == dep.tx_hash,
-                    Deposit.status == "completed",
-                    Deposit.id != dep.id,
-                )
-                .first()
+        # ── Duplicate completed transaction check ──
+        duplicate = (
+            db.query(Deposit)
+            .filter(
+                Deposit.tx_hash == deposit.tx_hash,
+                Deposit.status == "completed",
+                Deposit.id != deposit.id,
             )
-
-            if duplicate:
-                dep.status = "failed"
-                db.commit()
-
-                logger.warning(
-                    "Duplicate tx %s for deposit %s",
-                    dep.tx_hash,
-                    dep.id,
-                )
-                return False
-
-            credited = credit_user(
-                db,
-                dep,
-                verification["amount"],
-            )
-
-            return credited
-
-        except Exception as e:
-            db.rollback()
-            logger.exception(
-                "Error crediting deposit %s: %s",
-                deposit.id,
-                e,
-            )
-            return False
-
-        finally:
-            if isinstance(deposit_or_id, int) or db is not None:
-                db.close()
-
-    except AttributeError as e:
-        logger.exception(
-            "AttributeError verifying deposit %s: %s",
-            getattr(deposit, 'id', 'unknown'),
-            e,
+            .first()
         )
-        if db:
-            try:
-                dep = db.get(Deposit, deposit.id)
-                if dep:
-                    dep.status = "failed"
-                    db.commit()
-            except Exception:
-                db.rollback()
+
+        if duplicate:
+            deposit.status = "failed"
+            db.commit()
+            logger.warning(
+                "Duplicate tx %s for deposit %s",
+                deposit.tx_hash,
+                deposit.id,
+            )
+            return False
+
+        # ── Credit the user ──
+        return credit_user(db, deposit, verification["amount"])
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Error verifying deposit %s",
+            deposit_id if "deposit_id" in locals() else deposit_or_id,
+        )
         return False
 
     finally:
-        # Only close if we opened it here AND it's not already closed
-        if isinstance(deposit_or_id, int) and db is not None:
-            try:
-                db.close()
-            except Exception:
-                pass
+        db.close()
 
 
 # =====================================================
@@ -615,35 +559,34 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
 # =====================================================
 
 async def check_pending_deposits():
-    """
-    Scan all pending deposits and verify them.
-    """
+    """Scan all pending deposits and verify them."""
 
     db = SessionLocal()
 
     try:
-        deposits = (
-            db.query(Deposit)
+        deposit_ids = [
+            dep_id for (dep_id,) in
+            db.query(Deposit.id)
             .filter(Deposit.status == "pending")
             .all()
-        )
+        ]
 
         logger.info(
             "Checking %s pending deposits...",
-            len(deposits),
+            len(deposit_ids),
         )
 
     finally:
         db.close()
 
-    for deposit in deposits:
+    for deposit_id in deposit_ids:
         try:
-            await verify_deposit(deposit)
+            await verify_deposit(deposit_id)
 
         except Exception:
             logger.exception(
                 "Failed checking deposit %s",
-                deposit.id,
+                deposit_id,
             )
 
 
