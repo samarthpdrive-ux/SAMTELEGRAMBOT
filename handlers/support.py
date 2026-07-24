@@ -1,3 +1,5 @@
+import asyncio
+
 from aiogram import Router, F
 from aiogram.types import (
     CallbackQuery,
@@ -21,12 +23,11 @@ CONTACT_USERNAME = "sudarshan_ch"
 # CONTACT
 # =====================================================
 
-@router.callback_query(
-    F.data == "contact_info"
-)
-async def contact(
-        callback: CallbackQuery
-):
+@router.callback_query(F.data == "contact_info")
+async def contact(callback: CallbackQuery):
+    # Ack Telegram first — no reason to make the callback token's
+    # validity depend on whether message.answer() succeeds quickly.
+    await callback.answer()
 
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -44,62 +45,57 @@ async def contact(
         reply_markup=markup
     )
 
-    await callback.answer()
-
 
 # =====================================================
 # SUPPORT MENU
 # =====================================================
 
-@router.callback_query(
-    F.data == "support_ticket"
-)
+@router.callback_query(F.data == "support_ticket")
 async def support(
         callback: CallbackQuery,
         state: FSMContext
 ):
+    await callback.answer()
 
-    await state.set_state(
-        SupportState.waiting_message
-    )
+    await state.set_state(SupportState.waiting_message)
 
     await callback.message.answer(
         "🎫 Send your issue.\n\n"
         "Your next message will create a ticket."
     )
 
-    await callback.answer()
-
 
 # =====================================================
 # CREATE TICKET
 # =====================================================
 
-@router.message(
-    SupportState.waiting_message
-)
+def _save_ticket(user_id: int, text: str) -> int:
+    """Blocking DB write, run in a thread."""
+    db = SessionLocal()
+    try:
+        ticket = Ticket(
+            user_id=user_id,
+            message=text,
+            status="Open"
+        )
+        db.add(ticket)
+        db.commit()
+        db.refresh(ticket)
+        return ticket.id
+    finally:
+        db.close()
+
+
+@router.message(SupportState.waiting_message)
 async def create_ticket(
         message: Message,
         state: FSMContext
 ):
-
-    db = SessionLocal()
-
-    try:
-
-        ticket = Ticket(
-            user_id=message.from_user.id,
-            message=message.text,
-            status="Open"
-        )
-
-        db.add(ticket)
-        db.commit()
-
-        ticket_id = ticket.id
-
-    finally:
-        db.close()
+    ticket_id = await asyncio.to_thread(
+        _save_ticket,
+        message.from_user.id,
+        message.text,
+    )
 
     await state.clear()
 
@@ -111,9 +107,7 @@ async def create_ticket(
 
     # Notify admins
     for admin in ADMIN_IDS:
-
         try:
-
             username = (
                 f"@{message.from_user.username}"
                 if message.from_user.username
@@ -131,8 +125,4 @@ async def create_ticket(
             )
 
         except Exception as e:
-
-            print(
-                "Admin ticket error:",
-                e
-            )
+            print("Admin ticket error:", e)
