@@ -11,6 +11,19 @@ Verification:
 - Etherscan V2 API
 - Receipt parsing
 - Duplicate protection
+
+FIX NOTES (see chat for context):
+- Invalid tx_hash / unknown network deposits are now marked "failed"
+  immediately instead of being left "pending" forever. Previously,
+  a deposit created with a bad tx_hash (e.g. a stray menu-button
+  label like "📦 Manage Products" instead of a real hash) would sit
+  in "pending" and get re-checked + re-logged as an error every
+  CHECK_INTERVAL seconds forever, spamming logs indefinitely. Now it
+  self-terminates into "failed" on the first check.
+- The real root cause (a bot input handler saving arbitrary text as
+  tx_hash when the user leaves the deposit flow) lives outside this
+  file and should also be fixed there — validate/cancel before ever
+  creating the Deposit row.
 """
 
 from __future__ import annotations
@@ -377,6 +390,46 @@ def credit_user(
     return True
 
 
+def mark_deposit_failed(deposit_id: int, reason: str) -> None:
+    """
+    Mark a pending deposit as "failed" so the background loop stops
+    retrying it and spamming logs. Used whenever a deposit is found
+    to be structurally invalid (bad tx_hash, unknown network, etc.)
+    rather than "not yet confirmed on-chain".
+    """
+
+    db = SessionLocal()
+
+    try:
+        dep = db.get(Deposit, deposit_id)
+
+        if dep is None:
+            return
+
+        if dep.status != "pending":
+            # Already resolved by someone else — don't clobber it.
+            return
+
+        dep.status = "failed"
+        db.commit()
+
+        logger.warning(
+            "Deposit %s auto-failed: %s",
+            deposit_id,
+            reason,
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Could not auto-fail deposit %s",
+            deposit_id,
+        )
+
+    finally:
+        db.close()
+
+
 # =====================================================
 # VERIFY ONE DEPOSIT
 # =====================================================
@@ -394,7 +447,7 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
         None  -> deposit still pending (API unavailable or tx not indexed yet)
     """
 
-    # â”€â”€ Allow caller to pass an integer deposit ID â”€â”€
+    # ── Allow caller to pass an integer deposit ID ──
     db = None
     deposit = None
 
@@ -420,6 +473,10 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
                 deposit.id,
                 type(deposit.tx_hash),
             )
+            mark_deposit_failed(
+                deposit.id,
+                f"tx_hash not a string (got {type(deposit.tx_hash).__name__})",
+            )
             return False
 
         if not valid_hash(deposit.tx_hash):
@@ -427,6 +484,10 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
                 "Deposit %s has invalid tx_hash: %s",
                 deposit.id,
                 deposit.tx_hash,
+            )
+            mark_deposit_failed(
+                deposit.id,
+                f"tx_hash failed format check: {deposit.tx_hash!r}",
             )
             return False
 
@@ -437,6 +498,10 @@ async def verify_deposit(deposit_or_id: Union[Deposit, int]) -> Optional[bool]:
                 "Unknown network '%s' for deposit %s",
                 network,
                 deposit.id,
+            )
+            mark_deposit_failed(
+                deposit.id,
+                f"unknown network {network!r}",
             )
             return False
 
