@@ -1,3 +1,4 @@
+import re
 import uuid
 import logging
 
@@ -33,6 +34,23 @@ NETWORK_CALLBACKS = {
     "deposit_polygon": "POLYGON",
 }
 
+# Both supported networks are EVM chains, so a valid tx hash is always
+# "0x" + 64 hex characters.
+TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+
+# Every persistent reply-keyboard button label in the bot. If the user
+# taps one of these while mid-deposit-flow (instead of pasting a hash),
+# treat it as "leave the flow", not as a tx_hash to save.
+# TODO: make sure this list matches ALL your reply-keyboard buttons.
+MENU_BUTTON_LABELS = {
+    "📦 Manage Products",
+    "🛍 Products",
+    "💰 Deposit",
+    "📜 Orders",
+    "🤝 Referrals",
+    "🆘 Support",
+}
+
 
 # =====================================================
 # OPEN DEPOSIT MENU
@@ -40,11 +58,12 @@ NETWORK_CALLBACKS = {
 
 @router.callback_query(F.data == "deposit_start")
 async def deposit_menu(callback: CallbackQuery):
+    await callback.answer()
+
     await callback.message.answer(
         "💰 Select deposit network:",
         reply_markup=get_deposit_menu()
     )
-    await callback.answer()
 
 
 # =====================================================
@@ -56,6 +75,8 @@ async def select_network(
         callback: CallbackQuery,
         state: FSMContext
 ):
+    await callback.answer()
+
     network = NETWORK_CALLBACKS[callback.data]
 
     await state.update_data(network=network)
@@ -64,18 +85,42 @@ async def select_network(
     await callback.message.answer(
         "💰 Enter deposit amount:"
     )
-    await callback.answer()
 
 
 # =====================================================
 # AMOUNT
 # =====================================================
 
+def _create_deposit(telegram_id: int, amount: float, network: str) -> int:
+    """Blocking DB write, run in a thread."""
+    db = SessionLocal()
+    try:
+        deposit = Deposit(
+            telegram_id=telegram_id,
+            order_id=str(uuid.uuid4()),
+            amount=amount,
+            network=network,
+            status="waiting_hash"
+        )
+        db.add(deposit)
+        db.commit()
+        db.refresh(deposit)
+        return deposit.id
+    finally:
+        db.close()
+
+
 @router.message(DepositState.waiting_amount)
 async def process_amount(
         message: Message,
         state: FSMContext
 ):
+    # If the user bails via a menu button instead of typing an amount,
+    # leave the flow instead of trying to parse the button label as a number.
+    if message.text and message.text.strip() in MENU_BUTTON_LABELS:
+        await state.clear()
+        return
+
     try:
         amount = round(float(message.text), 2)
         if amount <= 0:
@@ -101,32 +146,21 @@ async def process_amount(
         await state.clear()
         return
 
-    db = SessionLocal()
+    import asyncio
+
     try:
-        deposit = Deposit(
-            telegram_id=message.from_user.id,
-            order_id=str(uuid.uuid4()),
-            amount=amount,
-            network=network,
-            status="waiting_hash"
+        deposit_id = await asyncio.to_thread(
+            _create_deposit,
+            message.from_user.id,
+            amount,
+            network,
         )
-
-        db.add(deposit)
-        db.commit()
-        db.refresh(deposit)
-
-        deposit_id = deposit.id
-
     except Exception as e:
         logger.exception("process_amount: failed to create deposit: %s", e)
-        db.rollback()
         await message.answer(
             "❌ Something went wrong creating your deposit. Please try again."
         )
         return
-
-    finally:
-        db.close()
 
     await state.update_data(deposit_id=deposit_id)
 
@@ -154,12 +188,78 @@ async def process_amount(
 # TXID
 # =====================================================
 
+def _check_duplicate(txid: str) -> bool:
+    db = SessionLocal()
+    try:
+        return (
+            db.query(Deposit)
+            .filter(Deposit.tx_hash == txid)
+            .first()
+        ) is not None
+    finally:
+        db.close()
+
+
+def _save_txid(deposit_id: int, txid: str) -> str:
+    """
+    Saves the tx_hash for a deposit.
+    Returns "ok", "not_found", or "duplicate".
+    """
+    db = SessionLocal()
+    try:
+        deposit = (
+            db.query(Deposit)
+            .filter(Deposit.id == deposit_id)
+            .first()
+        )
+
+        if not deposit:
+            return "not_found"
+
+        deposit.tx_hash = txid
+
+        try:
+            db.commit()
+        except IntegrityError:
+            # Race condition: two requests submitted the same tx_hash at once.
+            db.rollback()
+            return "duplicate"
+
+        return "ok"
+
+    finally:
+        db.close()
+
+
+def _set_pending_if_waiting(deposit_id: int) -> None:
+    db = SessionLocal()
+    try:
+        dep = (
+            db.query(Deposit)
+            .filter(Deposit.id == deposit_id)
+            .first()
+        )
+        if dep and dep.status == "waiting_hash":
+            dep.status = "pending"
+            db.commit()
+    finally:
+        db.close()
+
+
 @router.message(DepositState.waiting_txid)
 async def process_txid(
         message: Message,
         state: FSMContext
 ):
-    txid = message.text.strip()
+    import asyncio
+
+    txid = message.text.strip() if message.text else ""
+
+    # User tapped a menu button instead of pasting a hash — leave the
+    # deposit flow instead of saving the button label as a tx_hash.
+    if txid in MENU_BUTTON_LABELS:
+        await state.clear()
+        return
 
     data = await state.get_data()
     deposit_id = data.get("deposit_id")
@@ -171,45 +271,31 @@ async def process_txid(
         await state.clear()
         return
 
-    db = SessionLocal()
-    try:
-        existing = (
-            db.query(Deposit)
-            .filter(Deposit.tx_hash == txid)
-            .first()
+    # Validate format BEFORE ever writing it to the DB. This is what
+    # stops garbage tx_hash values from reaching deposit_checker.py.
+    if not TX_HASH_RE.match(txid):
+        await message.answer(
+            "❌ That doesn't look like a valid transaction hash.\n\n"
+            "It should look like:\n"
+            "<code>0x1234...abcd</code> (66 characters total)\n\n"
+            "Please paste the correct TXID/hash.",
+            parse_mode="HTML"
         )
+        return  # stay in waiting_txid, ask again
 
-        if existing:
-            await message.answer(
-                "❌ This TXID has already been used."
-            )
-            return
+    if await asyncio.to_thread(_check_duplicate, txid):
+        await message.answer("❌ This TXID has already been used.")
+        return
 
-        deposit = (
-            db.query(Deposit)
-            .filter(Deposit.id == deposit_id)
-            .first()
-        )
+    result = await asyncio.to_thread(_save_txid, deposit_id, txid)
 
-        if not deposit:
-            await message.answer("❌ Deposit not found.")
-            return
+    if result == "not_found":
+        await message.answer("❌ Deposit not found.")
+        return
 
-        deposit.tx_hash = txid
-
-        try:
-            db.commit()
-        except IntegrityError:
-            # Race condition: two requests submitted the same tx_hash
-            # at once — the DB-level unique constraint caught it.
-            db.rollback()
-            await message.answer(
-                "❌ This TXID has already been used."
-            )
-            return
-
-    finally:
-        db.close()
+    if result == "duplicate":
+        await message.answer("❌ This TXID has already been used.")
+        return
 
     await message.answer("🔍 Verifying transaction...")
 
@@ -229,20 +315,7 @@ async def process_txid(
     # leave it alone. Otherwise this just isn't confirmed on-chain yet —
     # move it to "pending" so the background checker keeps retrying,
     # instead of marking it failed and losing it.
-    db = SessionLocal()
-    try:
-        dep = (
-            db.query(Deposit)
-            .filter(Deposit.id == deposit_id)
-            .first()
-        )
-
-        if dep and dep.status == "waiting_hash":
-            dep.status = "pending"
-            db.commit()
-
-    finally:
-        db.close()
+    await asyncio.to_thread(_set_pending_if_waiting, deposit_id)
 
     await message.answer(
         "⏳ Transaction not confirmed yet.\n\n"
