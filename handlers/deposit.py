@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # NOTE: TRC20 and Binance UID deposits have been removed and must not
-# be reintroduced. Currently supported: USDT BEP20, USDT Polygon.
+# be reintroduced. Currently supported: USDT BEP20, USDT Polygon, UPI.
 NETWORK_ADDRESSES = {
     "BEP20": BEP20_ADDRESS,
     "POLYGON": POLYGON_ADDRESS,
@@ -32,11 +32,18 @@ NETWORK_ADDRESSES = {
 NETWORK_CALLBACKS = {
     "deposit_bep20": "BEP20",
     "deposit_polygon": "POLYGON",
+    "deposit_upi": "UPI",
 }
 
-# Both supported networks are EVM chains, so a valid tx hash is always
+CRYPTO_NETWORKS = {"BEP20", "POLYGON"}
+
+# Both crypto networks are EVM chains, so a valid tx hash is always
 # "0x" + 64 hex characters.
 TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
+
+# A UPI UTR (per NPCI) is always a 12-digit number. Kept in sync with
+# services/upi_checker.py's UTR_RE.
+UTR_RE = re.compile(r"^\d{12}$")
 
 # Every persistent reply-keyboard button label in the bot. If the user
 # taps one of these while mid-deposit-flow (instead of pasting a hash),
@@ -61,7 +68,7 @@ async def deposit_menu(callback: CallbackQuery):
     await callback.answer()
 
     await callback.message.answer(
-        "💰 Select deposit network:",
+        "💰 Select deposit method:",
         reply_markup=get_deposit_menu()
     )
 
@@ -132,16 +139,50 @@ async def process_amount(
     data = await state.get_data()
     network = data.get("network")
 
-    address = NETWORK_ADDRESSES.get(network)
+    if network == "UPI":
+        import config
+        upi_id = getattr(config, "UPI_ID", None)
 
-    if not address:
-        logger.error(
-            "process_amount: no receive address configured for network %s",
-            network,
+        if not upi_id:
+            logger.error("process_amount: UPI_ID not configured")
+            await message.answer(
+                "❌ This method isn't available right now. "
+                "Please choose another method."
+            )
+            await state.clear()
+            return
+
+        pay_to_line = f"Pay to:\n\n<code>{upi_id}</code>"
+        amount_line = f"₹{amount:.2f}"
+        after_payment_line = (
+            "After payment send:\n\n"
+            "UTR / Reference Number\n"
+            "(the 12-digit number from your payment app or bank SMS)"
         )
+
+    elif network in CRYPTO_NETWORKS:
+        address = NETWORK_ADDRESSES.get(network)
+
+        if not address:
+            logger.error(
+                "process_amount: no receive address configured for network %s",
+                network,
+            )
+            await message.answer(
+                "❌ This network isn't available right now. "
+                "Please choose another network."
+            )
+            await state.clear()
+            return
+
+        pay_to_line = f"Send funds to:\n\n<code>{address}</code>"
+        amount_line = f"{amount:.2f} USDT"
+        after_payment_line = "After payment send:\n\nTXID / HASH ID"
+
+    else:
+        logger.error("process_amount: unknown network %s", network)
         await message.answer(
-            "❌ This network isn't available right now. "
-            "Please choose another network."
+            "❌ Something went wrong. Please start a new deposit."
         )
         await state.clear()
         return
@@ -168,15 +209,13 @@ async def process_amount(
         (
             "💰 Deposit Created\n\n"
             "━━━━━━━━━━━━━━\n\n"
-            f"Network:\n{network}\n\n"
+            f"Method:\n{network}\n\n"
             f"Amount:\n"
-            f"{amount:.2f} USDT\n\n"
+            f"{amount_line}\n\n"
             "━━━━━━━━━━━━━━\n\n"
-            "Send funds to:\n\n"
-            f"<code>{address}</code>\n\n"
+            f"{pay_to_line}\n\n"
             "━━━━━━━━━━━━━━\n\n"
-            "After payment send:\n\n"
-            "TXID / HASH ID"
+            f"{after_payment_line}"
         ),
         parse_mode="HTML"
     )
@@ -185,7 +224,7 @@ async def process_amount(
 
 
 # =====================================================
-# TXID
+# TXID / UTR
 # =====================================================
 
 def _check_duplicate(txid: str) -> bool:
@@ -202,7 +241,7 @@ def _check_duplicate(txid: str) -> bool:
 
 def _save_txid(deposit_id: int, txid: str) -> str:
     """
-    Saves the tx_hash for a deposit.
+    Saves the tx_hash (crypto hash, or UPI UTR) for a deposit.
     Returns "ok", "not_found", or "duplicate".
     """
     db = SessionLocal()
@@ -221,7 +260,7 @@ def _save_txid(deposit_id: int, txid: str) -> str:
         try:
             db.commit()
         except IntegrityError:
-            # Race condition: two requests submitted the same tx_hash at once.
+            # Race condition: two requests submitted the same tx_hash/UTR at once.
             db.rollback()
             return "duplicate"
 
@@ -255,14 +294,15 @@ async def process_txid(
 
     txid = message.text.strip() if message.text else ""
 
-    # User tapped a menu button instead of pasting a hash — leave the
-    # deposit flow instead of saving the button label as a tx_hash.
+    # User tapped a menu button instead of pasting a hash/UTR — leave
+    # the deposit flow instead of saving the button label as one.
     if txid in MENU_BUTTON_LABELS:
         await state.clear()
         return
 
     data = await state.get_data()
     deposit_id = data.get("deposit_id")
+    network = data.get("network")
 
     if not deposit_id:
         await message.answer(
@@ -272,19 +312,30 @@ async def process_txid(
         return
 
     # Validate format BEFORE ever writing it to the DB. This is what
-    # stops garbage tx_hash values from reaching deposit_checker.py.
-    if not TX_HASH_RE.match(txid):
-        await message.answer(
-            "❌ That doesn't look like a valid transaction hash.\n\n"
-            "It should look like:\n"
-            "<code>0x1234...abcd</code> (66 characters total)\n\n"
-            "Please paste the correct TXID/hash.",
-            parse_mode="HTML"
-        )
-        return  # stay in waiting_txid, ask again
+    # stops garbage tx_hash/UTR values from reaching the checkers.
+    if network == "UPI":
+        if not UTR_RE.match(txid):
+            await message.answer(
+                "❌ That doesn't look like a valid UTR number.\n\n"
+                "It should be a 12-digit number, e.g.:\n"
+                "<code>123456789012</code>\n\n"
+                "Check your payment app / bank SMS and send the correct UTR.",
+                parse_mode="HTML"
+            )
+            return  # stay in waiting_txid, ask again
+    else:
+        if not TX_HASH_RE.match(txid):
+            await message.answer(
+                "❌ That doesn't look like a valid transaction hash.\n\n"
+                "It should look like:\n"
+                "<code>0x1234...abcd</code> (66 characters total)\n\n"
+                "Please paste the correct TXID/hash.",
+                parse_mode="HTML"
+            )
+            return  # stay in waiting_txid, ask again
 
     if await asyncio.to_thread(_check_duplicate, txid):
-        await message.answer("❌ This TXID has already been used.")
+        await message.answer("❌ This has already been used.")
         return
 
     result = await asyncio.to_thread(_save_txid, deposit_id, txid)
@@ -294,10 +345,10 @@ async def process_txid(
         return
 
     if result == "duplicate":
-        await message.answer("❌ This TXID has already been used.")
+        await message.answer("❌ This has already been used.")
         return
 
-    await message.answer("🔍 Verifying transaction...")
+    await message.answer("🔍 Verifying...")
 
     success = await verify_deposit(deposit_id)
 
@@ -311,14 +362,21 @@ async def process_txid(
         return
 
     # Verification didn't complete instantly. If verify_deposit already
-    # set a terminal "failed" state (reverted tx, duplicate, bad hash),
-    # leave it alone. Otherwise this just isn't confirmed on-chain yet —
-    # move it to "pending" so the background checker keeps retrying,
-    # instead of marking it failed and losing it.
+    # set a terminal "failed" state (reverted tx, duplicate, bad hash/UTR),
+    # leave it alone. Otherwise this just isn't confirmed yet — move it
+    # to "pending" so the background checker keeps retrying, instead of
+    # marking it failed and losing it.
     await asyncio.to_thread(_set_pending_if_waiting, deposit_id)
 
-    await message.answer(
-        "⏳ Transaction not confirmed yet.\n\n"
-        "It will be verified automatically once it has enough "
-        "blockchain confirmations — no need to resend the TXID."
-    )
+    if network == "UPI":
+        await message.answer(
+            "⏳ Payment not matched yet.\n\n"
+            "It will be confirmed automatically once we receive the "
+            "payment notification — no need to resend the UTR."
+        )
+    else:
+        await message.answer(
+            "⏳ Transaction not confirmed yet.\n\n"
+            "It will be verified automatically once it has enough "
+            "blockchain confirmations — no need to resend the TXID."
+        )
