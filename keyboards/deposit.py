@@ -6,10 +6,9 @@ from aiogram.types import (
 
 def get_deposit_menu() -> InlineKeyboardMarkup:
     """
-    Network-selection keyboard shown when a user starts a deposit.
-
+    Network/method-selection keyboard shown when a user starts a deposit.
     NOTE: TRC20 and Binance UID deposits have been removed and must
-    not be reintroduced. Currently supported: USDT BEP20, USDT Polygon.
+    not be reintroduced. Currently supported: USDT BEP20, USDT Polygon, UPI.
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -23,6 +22,12 @@ def get_deposit_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="🟣 USDT Polygon",
                     callback_data="deposit_polygon"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🇮🇳 UPI",
+                    callback_data="deposit_upi"
                 )
             ]
         ]
