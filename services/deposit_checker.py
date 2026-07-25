@@ -6,8 +6,10 @@ Deposit Checker (combined: crypto + UPI)
 Supports:
 - BEP20 (BSC)      -> Etherscan V2 API, on-chain receipt verification
 - Polygon          -> Etherscan V2 API, on-chain receipt verification
-- UPI              -> Gmail IMAP, matches a user-submitted UTR against
-                      FamApp payment-notification emails
+- UPI              -> Gmail IMAP, matches a user-submitted reference
+                      (bank UTR, e.g. "421512345678", OR an app txn id
+                      like FamApp's "FMPIB6269486679") against payment
+                      notification emails
 
 Both paths funnel into the same verify_deposit() / return convention
 (None = still pending, False = failed, dict = confirmed transfer),
@@ -113,17 +115,28 @@ IMAP_LOOKBACK_DAYS = getattr(config, "IMAP_LOOKBACK_DAYS", 2)
 # handlers/deposit.py's UTR_RE.
 UTR_RE = re.compile(r"^\d{12}$")
 
-# Looks for a 12-digit number near a UTR/RRN/reference label.
+# Some apps (FamApp and others) don't surface the bank UTR to the user
+# at all — instead they show their own transaction ID, e.g.
+# "FMPIB6269486679" (a few letters, then digits). Accept that shape too.
+TXN_ID_RE = re.compile(r"^[A-Za-z]{3,10}\d{6,15}$")
+
+# Looks for a UTR/txn-id near a UTR/RRN/reference/txn-id label.
+# Captures either a 12-digit UTR or a letters+digits app txn id.
 # TUNE THIS against a real FamApp email sample.
 UTR_LABEL_RE = re.compile(
-    r"(?:UTR|UPI\s*Ref(?:erence)?(?:\s*No\.?)?|RRN|Txn\s*Ref(?:erence)?)"
-    r"\D{0,10}(\d{12})",
+    r"(?:UTR(?:\s*No\.?)?|UPI\s*Ref(?:erence)?(?:\s*No\.?)?|RRN|"
+    r"Txn\s*Ref(?:erence)?|Transaction\s*ID|Txn(?:\s*ID)?)"
+    r"\D{0,10}([A-Za-z0-9]{8,20})",
     re.IGNORECASE,
 )
 
-# Fallback: any bare 12-digit number in the email, used only if the
-# labeled regex above finds nothing.
+# Fallback 1: any bare 12-digit number in the email.
 UTR_FALLBACK_RE = re.compile(r"\b(\d{12})\b")
+
+# Fallback 2: any bare app-style txn id (letters then digits) in the
+# email, e.g. "FMPIB6269486679". Used only if the two above find
+# nothing.
+TXN_ID_FALLBACK_RE = re.compile(r"\b([A-Za-z]{3,10}\d{6,15})\b")
 
 # Looks for an amount like "Rs. 500", "₹500.00", "INR 1,200"
 AMOUNT_RE = re.compile(
@@ -363,10 +376,15 @@ async def verify_transaction(
 # =====================================================
 
 def valid_utr(utr: str) -> bool:
-    """Validate UTR format. Kept in sync with handlers/deposit.py's UTR_RE."""
+    """
+    Validate a user-submitted UPI reference. Accepts either a bank UTR
+    (12 digits) or an app-generated transaction id like
+    "FMPIB6269486679" (letters followed by digits). Kept in sync with
+    handlers/deposit.py's UTR_RE / TXN_ID_RE.
+    """
     if not isinstance(utr, str):
         return False
-    return bool(UTR_RE.match(utr))
+    return bool(UTR_RE.match(utr) or TXN_ID_RE.match(utr))
 
 
 def _decode_text(text) -> str:
@@ -411,6 +429,10 @@ def _extract_utr(text: str) -> Optional[str]:
         return match.group(1)
 
     match = UTR_FALLBACK_RE.search(text)
+    if match:
+        return match.group(1)
+
+    match = TXN_ID_FALLBACK_RE.search(text)
     if match:
         return match.group(1)
 
@@ -500,7 +522,10 @@ def _fetch_famapp_matches() -> dict:
                 )
                 continue
 
-            matches[utr] = amount
+            # Normalize case — a user might type "fmpib6269486679" while
+            # the email shows "FMPIB6269486679". Pure-digit UTRs are
+            # unaffected by .upper().
+            matches[utr.upper()] = amount
 
         return matches
 
@@ -539,7 +564,7 @@ async def verify_upi(deposit: Deposit) -> Optional[Union[dict, bool]]:
         logger.exception("verify_upi: unexpected error checking deposit %s", deposit.id)
         return None  # treat as transient, retry on next pass
 
-    amount = matches.get(utr)
+    amount = matches.get(utr.upper())
 
     if amount is None:
         return None  # not found (yet) — stays pending
