@@ -41,9 +41,16 @@ CRYPTO_NETWORKS = {"BEP20", "POLYGON"}
 # "0x" + 64 hex characters.
 TX_HASH_RE = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
-# A UPI UTR (per NPCI) is always a 12-digit number. Kept in sync with
-# services/upi_checker.py's UTR_RE.
+# A UPI UTR (per NPCI) is always a 12-digit number. Some apps (FamApp
+# and others) instead show their own transaction id, e.g.
+# "FMPIB6269486679" (letters then digits) — accept that shape too.
+# Kept in sync with services/deposit_checker.py's UTR_RE / TXN_ID_RE.
 UTR_RE = re.compile(r"^\d{12}$")
+TXN_ID_RE = re.compile(r"^[A-Za-z]{3,10}\d{6,15}$")
+
+
+def _valid_upi_reference(value: str) -> bool:
+    return bool(UTR_RE.match(value) or TXN_ID_RE.match(value))
 
 # Every persistent reply-keyboard button label in the bot. If the user
 # taps one of these while mid-deposit-flow (instead of pasting a hash),
@@ -156,8 +163,9 @@ async def process_amount(
         amount_line = f"₹{amount:.2f}"
         after_payment_line = (
             "After payment send:\n\n"
-            "UTR / Reference Number\n"
-            "(the 12-digit number from your payment app or bank SMS)"
+            "UTR / Transaction ID\n"
+            "(the reference number from your payment app, bank SMS, "
+            "or confirmation email — e.g. 123456789012 or FMPIB6269486679)"
         )
 
     elif network in CRYPTO_NETWORKS:
@@ -314,12 +322,14 @@ async def process_txid(
     # Validate format BEFORE ever writing it to the DB. This is what
     # stops garbage tx_hash/UTR values from reaching the checkers.
     if network == "UPI":
-        if not UTR_RE.match(txid):
+        if not _valid_upi_reference(txid):
             await message.answer(
-                "❌ That doesn't look like a valid UTR number.\n\n"
-                "It should be a 12-digit number, e.g.:\n"
-                "<code>123456789012</code>\n\n"
-                "Check your payment app / bank SMS and send the correct UTR.",
+                "❌ That doesn't look like a valid UTR / transaction ID.\n\n"
+                "It should look like one of these:\n"
+                "<code>123456789012</code> (12-digit bank UTR)\n"
+                "<code>FMPIB6269486679</code> (app transaction ID)\n\n"
+                "Check your payment app / bank SMS / confirmation email "
+                "and send the correct one.",
                 parse_mode="HTML"
             )
             return  # stay in waiting_txid, ask again
