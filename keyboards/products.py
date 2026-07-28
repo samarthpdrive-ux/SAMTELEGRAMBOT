@@ -4,13 +4,19 @@ from aiogram.types import (
 )
 
 
-def buy_keyboard(product_id: int):
+def buy_keyboard(product_id: int, button_text: str = "🛒 Buy"):
+    """
+    Opens the quantity selector instead of buying instantly — lets the
+    customer pick how many units they want before confirming.
+    `button_text` can be swapped to "📦 Preorder" for out-of-stock items
+    that have preorder enabled.
+    """
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🛒 Buy",
-                    callback_data=f"buy_{product_id}"
+                    text=button_text,
+                    callback_data=f"select_qty_{product_id}"
                 )
             ]
         ]
