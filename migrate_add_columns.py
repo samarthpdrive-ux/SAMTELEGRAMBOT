@@ -1,78 +1,83 @@
 """
-One-off migration: adds the new columns needed for delivery type,
-preorder, low-stock threshold, and quantity to already-existing tables.
+migrate_user_decimal.py
 
-`create_tables.py` (Base.metadata.create_all) only creates tables that
-don't exist yet — it will NOT add columns to a table you already have
-rows in. Run this once after pulling the new code:
+One-off migration: converts the `users` table's money columns from
+FLOAT to DECIMAL(20, 8) (matching orders.amount / products.price),
+and is_banned from a bare Integer flag to a real BOOLEAN.
 
-    python migrate_add_columns.py
+Run this ONCE, after deploying the new models/user.py, and BEFORE the
+bot process that uses it starts serving traffic:
+
+    python migrate_user_decimal.py
+
+(Sibling script to the existing migrate_add_columns.py, which
+already handles products/orders columns — this one just covers
+users.)
+
+Why this needs an explicit migration instead of just changing the
+model:
+- `Base.metadata.create_all()` (create_tables.py) only creates
+  tables that don't exist yet — it never ALTERs an existing table's
+  column type.
+- A live FLOAT column holds imprecise binary-float values (e.g. a
+  balance that displays as 10.10 might actually be stored as
+  10.099999999...). This migration widens the column via
+  `MODIFY COLUMN ... DECIMAL(20, 8)` — MySQL/TiDB does the numeric
+  conversion in-place, which is the best available fix short of
+  reconstructing exact historical amounts from transaction history
+  (out of scope here — this migration does not attempt to "correct"
+  existing balances, only to change their column type going forward).
+- BOOLEAN is a MySQL/TiDB alias for TINYINT(1), so existing 0/1
+  Integer values are already valid — this is a type-label change with
+  no data risk.
+
+This script is idempotent: it checks each column's current type
+before touching it, so running it twice (or against a DB that already
+has these types) is a no-op.
 """
 
 from sqlalchemy import text
+
 from database import engine
 
-# (table, column, DDL type)
-COLUMNS = [
-    ("products", "delivery_type", "VARCHAR(20) DEFAULT 'automatic'"),
-    ("products", "preorder", "BOOLEAN DEFAULT FALSE"),
-    ("products", "low_stock_threshold", "INT DEFAULT 3"),
-    ("orders", "quantity", "INT DEFAULT 1"),
-    ("orders", "delivery_type", "VARCHAR(20) DEFAULT 'automatic'"),
-    ("orders", "is_preorder", "BOOLEAN DEFAULT FALSE"),
+COLUMN_CHANGES = [
+    ("users", "balance", "DECIMAL(20, 8) NOT NULL DEFAULT 0"),
+    ("users", "total_spent", "DECIMAL(20, 8) NOT NULL DEFAULT 0"),
+    ("users", "total_deposited", "DECIMAL(20, 8) NOT NULL DEFAULT 0"),
+    ("users", "referral_earnings", "DECIMAL(20, 8) NOT NULL DEFAULT 0"),
+    ("users", "is_banned", "BOOLEAN NOT NULL DEFAULT FALSE"),
 ]
 
 
-def column_exists(conn, table, column) -> bool:
+def _current_type(conn, table: str, column: str) -> str:
     result = conn.execute(
         text(
-            "SELECT COUNT(*) FROM information_schema.columns "
+            "SELECT DATA_TYPE FROM information_schema.columns "
             "WHERE table_schema = DATABASE() "
             "AND table_name = :table AND column_name = :column"
         ),
         {"table": table, "column": column},
     )
-    return result.scalar() > 0
+    row = result.first()
+    return (row[0] or "").lower() if row else ""
 
 
 def main():
     with engine.begin() as conn:
-        for table, column, ddl_type in COLUMNS:
-            if column_exists(conn, table, column):
-                print(f"⏭  {table}.{column} already exists, skipping.")
+        for table, column, new_type in COLUMN_CHANGES:
+            current = _current_type(conn, table, column)
+
+            target_data_type = "decimal" if "DECIMAL" in new_type else "tinyint"
+
+            if current == target_data_type:
+                print(f"⏭  {table}.{column} is already {current}, skipping.")
                 continue
 
-            print(f"➕ Adding {table}.{column} ...")
+            print(f"🔧 Converting {table}.{column} ({current or 'unknown'} -> {new_type}) ...")
             conn.execute(
-                text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
+                text(f"ALTER TABLE {table} MODIFY COLUMN {column} {new_type}")
             )
-            print(f"✅ Added {table}.{column}")
-
-        # Backfill existing rows so old data doesn't have NULLs where
-        # the app expects a real default.
-        conn.execute(
-            text(
-                "UPDATE products SET delivery_type = 'automatic' "
-                "WHERE delivery_type IS NULL"
-            )
-        )
-        conn.execute(
-            text(
-                "UPDATE products SET low_stock_threshold = 3 "
-                "WHERE low_stock_threshold IS NULL"
-            )
-        )
-        conn.execute(
-            text(
-                "UPDATE orders SET quantity = 1 WHERE quantity IS NULL"
-            )
-        )
-        conn.execute(
-            text(
-                "UPDATE orders SET delivery_type = 'automatic' "
-                "WHERE delivery_type IS NULL"
-            )
-        )
+            print(f"✅ Converted {table}.{column}")
 
     print("✅ Migration complete.")
 
