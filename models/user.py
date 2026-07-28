@@ -1,11 +1,10 @@
-# models/user.py
-
 from sqlalchemy import (
     Column,
     Integer,
     BigInteger,
     String,
-    Float
+    Numeric,
+    Boolean,
 )
 
 from database import Base
@@ -14,75 +13,134 @@ from database import Base
 class User(Base):
     __tablename__ = "users"
 
+    # -----------------------------------------
+    # Primary Key
+    # -----------------------------------------
+
     id = Column(
         Integer,
         primary_key=True,
-        index=True
+        autoincrement=True,
+        index=True,
     )
 
-    # Telegram Information
+    # -----------------------------------------
+    # Telegram
+    # -----------------------------------------
+
     telegram_id = Column(
         BigInteger,
         unique=True,
-        nullable=False
+        nullable=False,
+        index=True,
     )
 
     username = Column(
         String(100),
-        nullable=True
+        nullable=True,
     )
 
     full_name = Column(
         String(255),
-        nullable=False
+        nullable=False,
     )
 
+    # -----------------------------------------
     # Wallet
+    # -----------------------------------------
+
     balance = Column(
-        Float,
-        default=0.0
+        Numeric(20, 8),
+        nullable=False,
+        default=0,
     )
 
-    # Referral System
+    total_deposited = Column(
+        Numeric(20, 8),
+        nullable=False,
+        default=0,
+    )
+
+    total_spent = Column(
+        Numeric(20, 8),
+        nullable=False,
+        default=0,
+    )
+
+    # -----------------------------------------
+    # Referral
+    # -----------------------------------------
+
     referral_code = Column(
         String(100),
         unique=True,
-        nullable=True
+        nullable=True,
+        index=True,
     )
 
     referred_by = Column(
         BigInteger,
-        nullable=True
+        nullable=True,
+        index=True,
     )
 
     total_referrals = Column(
         Integer,
-        default=0
+        nullable=False,
+        default=0,
     )
 
     referral_earnings = Column(
-        Float,
-        default=0.0
+        Numeric(20, 8),
+        nullable=False,
+        default=0,
     )
 
+    # -----------------------------------------
     # Statistics
+    # -----------------------------------------
+
     total_orders = Column(
         Integer,
-        default=0
+        nullable=False,
+        default=0,
     )
 
-    total_spent = Column(
-        Float,
-        default=0.0
-    )
+    # -----------------------------------------
+    # Status
+    # -----------------------------------------
 
-    total_deposited = Column(
-        Float,
-        default=0.0
-    )
-
-    # User Status
     is_banned = Column(
-        Integer,
-        default=0
+        Boolean,
+        nullable=False,
+        default=False,
     )
+
+    # -----------------------------------------
+    # Helper Methods
+    # -----------------------------------------
+
+    @property
+    def balance_float(self):
+        return float(self.balance or 0)
+
+    @property
+    def spent_float(self):
+        return float(self.total_spent or 0)
+
+    @property
+    def deposited_float(self):
+        return float(self.total_deposited or 0)
+
+    @property
+    def referral_float(self):
+        return float(self.referral_earnings or 0)
+
+    def __repr__(self):
+        return (
+            f"<User("
+            f"id={self.id}, "
+            f"telegram_id={self.telegram_id}, "
+            f"balance={self.balance}"
+            f")>"
+        )
