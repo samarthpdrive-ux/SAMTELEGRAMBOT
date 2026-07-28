@@ -5,6 +5,7 @@ from models.product import Product
 from models.order import Order
 from models.deposit import Deposit
 from models.ticket import Ticket
+from models.menu_state import MenuState
 
 print("Creating tables...")
 
