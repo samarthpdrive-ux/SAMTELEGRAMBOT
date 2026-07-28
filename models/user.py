@@ -1,11 +1,26 @@
-from sqlalchemy import (
-    Column,
-    Integer,
-    BigInteger,
-    String,
-    Numeric,
-    Boolean,
-)
+"""
+models/user.py
+
+User model — SQLAlchemy 2.x declarative style.
+
+Money fields (balance, total_spent, total_deposited,
+referral_earnings) are DECIMAL(20, 8), matching Order.amount and
+Product.price. Do not do float math against these attributes anywhere
+in the codebase — always Decimal(str(x)) if you need to combine them
+with a literal, and only call float() at the very last moment, when
+formatting text for Telegram.
+
+is_banned is a real Boolean now instead of an Integer 0/1 flag. A
+MySQL/TiDB BOOLEAN column is just an alias for TINYINT(1), so this is
+a compatible in-place type change for existing 0/1 data — see
+migrations/migrate_user_decimal.py.
+"""
+
+from decimal import Decimal
+from typing import Optional
+
+from sqlalchemy import BigInteger, Boolean, Integer, Numeric, String
+from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
 
@@ -13,134 +28,124 @@ from database import Base
 class User(Base):
     __tablename__ = "users"
 
-    # -----------------------------------------
-    # Primary Key
-    # -----------------------------------------
-
-    id = Column(
+    id: Mapped[int] = mapped_column(
         Integer,
         primary_key=True,
-        autoincrement=True,
         index=True,
     )
 
-    # -----------------------------------------
-    # Telegram
-    # -----------------------------------------
+    # ------------------------------------------------------------
+    # Telegram Information
+    # ------------------------------------------------------------
 
-    telegram_id = Column(
+    telegram_id: Mapped[int] = mapped_column(
         BigInteger,
         unique=True,
         nullable=False,
         index=True,
     )
 
-    username = Column(
-        String(100),
-        nullable=True,
-    )
+    username: Mapped[Optional[str]] = mapped_column(String(100))
 
-    full_name = Column(
+    full_name: Mapped[str] = mapped_column(
         String(255),
         nullable=False,
     )
 
-    # -----------------------------------------
-    # Wallet
-    # -----------------------------------------
+    # ------------------------------------------------------------
+    # Wallet — all DECIMAL(20, 8), never Float
+    # ------------------------------------------------------------
 
-    balance = Column(
+    balance: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),
         nullable=False,
-        default=0,
+        default=Decimal("0"),
+        server_default="0",
     )
 
-    total_deposited = Column(
-        Numeric(20, 8),
-        nullable=False,
-        default=0,
-    )
+    # ------------------------------------------------------------
+    # Referral System
+    # ------------------------------------------------------------
 
-    total_spent = Column(
-        Numeric(20, 8),
-        nullable=False,
-        default=0,
-    )
-
-    # -----------------------------------------
-    # Referral
-    # -----------------------------------------
-
-    referral_code = Column(
+    referral_code: Mapped[Optional[str]] = mapped_column(
         String(100),
         unique=True,
-        nullable=True,
-        index=True,
     )
 
-    referred_by = Column(
-        BigInteger,
-        nullable=True,
-        index=True,
-    )
+    referred_by: Mapped[Optional[int]] = mapped_column(BigInteger)
 
-    total_referrals = Column(
+    total_referrals: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
-    referral_earnings = Column(
+    referral_earnings: Mapped[Decimal] = mapped_column(
         Numeric(20, 8),
         nullable=False,
-        default=0,
+        default=Decimal("0"),
+        server_default="0",
     )
 
-    # -----------------------------------------
+    # ------------------------------------------------------------
     # Statistics
-    # -----------------------------------------
+    # ------------------------------------------------------------
 
-    total_orders = Column(
+    total_orders: Mapped[int] = mapped_column(
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
-    # -----------------------------------------
-    # Status
-    # -----------------------------------------
+    total_spent: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
 
-    is_banned = Column(
+    total_deposited: Mapped[Decimal] = mapped_column(
+        Numeric(20, 8),
+        nullable=False,
+        default=Decimal("0"),
+        server_default="0",
+    )
+
+    # ------------------------------------------------------------
+    # User Status
+    # ------------------------------------------------------------
+
+    is_banned: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=False,
+        server_default="0",
     )
 
-    # -----------------------------------------
-    # Helper Methods
-    # -----------------------------------------
+    # ------------------------------------------------------------
+    # Display-only helpers — float conversion happens HERE and only
+    # here, right before formatting text for Telegram. Never use these
+    # in a comparison or another calculation; use the Decimal
+    # attribute itself for that.
+    # ------------------------------------------------------------
 
     @property
-    def balance_float(self):
-        return float(self.balance or 0)
+    def balance_display(self) -> float:
+        return float(self.balance)
 
     @property
-    def spent_float(self):
-        return float(self.total_spent or 0)
+    def total_spent_display(self) -> float:
+        return float(self.total_spent)
 
     @property
-    def deposited_float(self):
-        return float(self.total_deposited or 0)
+    def total_deposited_display(self) -> float:
+        return float(self.total_deposited)
 
     @property
-    def referral_float(self):
-        return float(self.referral_earnings or 0)
+    def referral_earnings_display(self) -> float:
+        return float(self.referral_earnings)
 
-    def __repr__(self):
-        return (
-            f"<User("
-            f"id={self.id}, "
-            f"telegram_id={self.telegram_id}, "
-            f"balance={self.balance}"
-            f")>"
-        )
+    def __repr__(self) -> str:
+        return f"<User id={self.id} telegram_id={self.telegram_id}>"
