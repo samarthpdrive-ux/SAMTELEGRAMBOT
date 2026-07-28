@@ -393,22 +393,57 @@ async def etherscan_receipt(
         )
         return None
 
+    # NOTE: "status": "0" only appears on "account"/"log"-style
+    # Etherscan endpoints. The "proxy" module used here
+    # (eth_getTransactionReceipt) never sets a top-level "status" —
+    # on failure it instead returns a JSON-RPC "error" object with no
+    # "result" key. The check below was previously dead code for this
+    # endpoint, so an invalid API key / rate limit / bad param just
+    # looked identical to "tx not indexed yet", with nothing in the
+    # logs explaining why.
     if data.get("status") == "0":
         logger.error(
-            "[%s] API returned error: %s",
+            "[%s] API returned error for tx %s: %s",
             chain.name,
+            tx_hash,
             data.get("message", "Unknown error"),
+        )
+        return None
+
+    if "error" in data:
+        # FIX: this is the actual error shape the proxy module
+        # returns. Previously fell through to "result is None" with
+        # zero indication of what went wrong.
+        logger.error(
+            "[%s] proxy API error for tx %s: %s",
+            chain.name,
+            tx_hash,
+            data.get("error"),
         )
         return None
 
     result = data.get("result")
 
     if result is None:
+        # A bare {"result": null} is the normal, expected shape while
+        # the tx just hasn't been indexed yet — genuinely "still
+        # pending", not an error.
+        logger.info(
+            "[%s] tx %s not yet indexed by Etherscan (result=null)",
+            chain.name,
+            tx_hash,
+        )
         return None
 
     if isinstance(result, dict):
         return result
 
+    logger.error(
+        "[%s] unexpected result shape for tx %s: %r",
+        chain.name,
+        tx_hash,
+        result,
+    )
     return None
 
 
@@ -691,6 +726,21 @@ def _fetch_famapp_matches() -> dict:
 
         email_ids = data[0].split()
 
+        # FIX: this is the single most useful diagnostic line in this
+        # whole module. If FAMAPP_SENDER_EMAIL (config.py) doesn't
+        # exactly match the real "From:" address on payment emails,
+        # this search silently returns 0 results forever — every UPI
+        # deposit sits "pending" indefinitely with no error anywhere,
+        # because "found nothing" and "found nothing yet" look
+        # identical. Logging the count on every check makes a
+        # persistent 0 obvious instead of invisible.
+        logger.info(
+            "upi: IMAP search for FROM \"%s\" SINCE %s found %s email(s)",
+            FAMAPP_SENDER_EMAIL,
+            since_date,
+            len(email_ids),
+        )
+
         # Only look at the most recent emails. Sequence numbers returned
         # by search() are ascending (oldest first), so the tail of the
         # list is the newest mail — which is all that matters for
@@ -698,6 +748,18 @@ def _fetch_famapp_matches() -> dict:
         recent_ids = email_ids[-MAX_EMAILS_TO_SCAN:]
 
         if not recent_ids:
+            # FIX: if this fires every single check, FAMAPP_SENDER_EMAIL
+            # is almost certainly wrong. Open a real FamApp payment
+            # email in Gmail -> "Show original" -> copy the exact
+            # From: address into config.py.
+            logger.warning(
+                "upi: 0 emails matched FROM \"%s\" in the last %s day(s) — "
+                "if this keeps happening, FAMAPP_SENDER_EMAIL in "
+                "config.py is likely wrong. Open a real FamApp payment "
+                "email -> 'Show original' -> copy the exact From address.",
+                FAMAPP_SENDER_EMAIL,
+                IMAP_LOOKBACK_DAYS,
+            )
             return {}
 
         # Fetch all of them in ONE IMAP round-trip instead of one
