@@ -10,7 +10,8 @@ MYSQL_DB = "telegram_shop"
 # Change this if your certificate has a different filename
 MYSQL_SSL_CA = "ca.pem"
 ADMIN_IDS = [
-    7943742895
+    7943742895,
+    8790675033
 ]
 # ==========================================================
 # DEPOSIT NETWORKS
