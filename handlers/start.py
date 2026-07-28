@@ -16,6 +16,8 @@ from keyboards.menu import (
     get_admin_main_menu
 )
 
+from utils.menu_tracker import replace_menu, track
+
 router = Router()
 
 
@@ -61,9 +63,12 @@ async def send_dashboard(
 
         if isinstance(target, Message):
 
-            await target.answer(
-                text,
-                reply_markup=keyboard
+            await replace_menu(
+                bot=target.bot,
+                chat_id=target.chat.id,
+                telegram_id=telegram_id,
+                text=text,
+                keyboard=keyboard
             )
 
         else:
@@ -71,6 +76,12 @@ async def send_dashboard(
             await target.message.edit_text(
                 text,
                 reply_markup=keyboard
+            )
+
+            track(
+                telegram_id,
+                target.message.chat.id,
+                target.message.message_id
             )
 
     finally:
