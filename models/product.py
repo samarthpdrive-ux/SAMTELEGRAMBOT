@@ -47,3 +47,24 @@ class Product(Base):
         Boolean,
         default=True
     )
+
+    # "automatic" -> deliver instantly from file_content accounts
+    # "manual"    -> admin fulfills each order by hand from the Orders panel
+    # "hybrid"    -> auto-deliver if an account is available, else queue for manual fulfillment
+    delivery_type = Column(
+        String(20),
+        default="automatic"
+    )
+
+    # If True, customers can still order at 0 stock; the order is queued
+    # as a preorder instead of being blocked.
+    preorder = Column(
+        Boolean,
+        default=False
+    )
+
+    # Admins get a Telegram alert once stock drops to/below this number.
+    low_stock_threshold = Column(
+        Integer,
+        default=3
+    )
