@@ -1,24 +1,59 @@
-# Tracks the most recent "menu" message per user (chat_id, message_id).
+# Tracks the most recent "menu" message per user (chat_id, message_id),
+# stored in the database so it survives bot restarts (e.g. Render's free
+# tier spinning the service down between requests).
 #
 # Why this exists:
 # Callback buttons can edit the message they're attached to (edit_text),
 # so tapping a button never creates a duplicate. But a text COMMAND like
 # /admin or /start has no existing bot message to edit — it can only send
-# a new one. That's what caused the old menu to stay stuck on screen while
-# a new one appeared below it.
-#
-# replace_menu() fixes this: before sending a fresh menu, it deletes the
-# last tracked one for that user, so only one menu is ever visible.
-#
-# Note: this is in-memory, so it resets on bot restart. That's fine — the
-# only effect is that immediately after a restart, one old menu message
-# might not get auto-deleted the first time. It self-corrects after that.
+# a new one. replace_menu() fixes this by deleting the last tracked menu
+# message for that user before sending a fresh one, so only one menu is
+# ever visible, even across restarts.
 
-active_menu_message = {}  # telegram_id -> (chat_id, message_id)
+from database import SessionLocal
+from models.menu_state import MenuState
 
 
 def track(telegram_id: int, chat_id: int, message_id: int):
-    active_menu_message[telegram_id] = (chat_id, message_id)
+    db = SessionLocal()
+    try:
+        state = (
+            db.query(MenuState)
+            .filter(MenuState.telegram_id == telegram_id)
+            .first()
+        )
+
+        if state:
+            state.chat_id = chat_id
+            state.message_id = message_id
+        else:
+            state = MenuState(
+                telegram_id=telegram_id,
+                chat_id=chat_id,
+                message_id=message_id
+            )
+            db.add(state)
+
+        db.commit()
+    finally:
+        db.close()
+
+
+def get_tracked(telegram_id: int):
+    db = SessionLocal()
+    try:
+        state = (
+            db.query(MenuState)
+            .filter(MenuState.telegram_id == telegram_id)
+            .first()
+        )
+
+        if not state:
+            return None
+
+        return (state.chat_id, state.message_id)
+    finally:
+        db.close()
 
 
 async def replace_menu(
@@ -29,7 +64,7 @@ async def replace_menu(
         keyboard,
         parse_mode: str = None
 ):
-    old = active_menu_message.get(telegram_id)
+    old = get_tracked(telegram_id)
 
     if old:
         old_chat_id, old_message_id = old
