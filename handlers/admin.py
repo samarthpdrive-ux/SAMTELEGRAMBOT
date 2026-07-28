@@ -22,13 +22,18 @@ from keyboards.menu import get_admin_main_menu
 
 from states.broadcast import BroadcastState
 
-from utils.menu_tracker import replace_menu, track
-
 router = Router()
 
 
 # =====================================================
 # /admin
+#
+# This used to send a brand new "Admin Panel" message every time,
+# which is what caused the duplicate section stacking below your
+# dashboard. The 👑 button on your dashboard already opens the same
+# panel correctly (it edits the dashboard in place — no duplicate).
+# So /admin now just points you to that button instead of creating
+# a second, separate menu.
 # =====================================================
 
 @router.message(Command("admin"))
@@ -39,12 +44,9 @@ async def admin_cmd(
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    await replace_menu(
-        bot=message.bot,
-        chat_id=message.chat.id,
-        telegram_id=message.from_user.id,
-        text="👑 Admin Panel",
-        keyboard=get_admin_panel()
+    await message.answer(
+        "👑 Tap the crown button on your dashboard above to open the Admin Panel.\n\n"
+        "(Send /start if you don't see your dashboard.)"
     )
 
 
@@ -71,12 +73,6 @@ async def admin_panel(
     await callback.message.edit_text(
         "👑 Admin Panel",
         reply_markup=get_admin_panel()
-    )
-
-    track(
-        callback.from_user.id,
-        callback.message.chat.id,
-        callback.message.message_id
     )
 
     await callback.answer()
