@@ -2,17 +2,27 @@ print("✅ NEW ADMIN ORDERS FILE LOADED")
 
 from aiogram import Router, F
 from aiogram.types import (
+    Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton
 )
+from aiogram.fsm.context import FSMContext
 
 from config import ADMIN_IDS
 from database import SessionLocal
 from models.order import Order
 from models.user import User
+from states.delivery_states import DeliverOrder
 
 router = Router()
+
+STATUS_LABELS = {
+    "completed": "✅ Completed",
+    "pending_manual": "⏳ Pending (manual fulfillment)",
+    "preorder": "📦 Preorder (waitlisted)",
+    "refunded": "💸 Refunded",
+}
 
 
 def is_admin(user_id: int):
@@ -81,6 +91,9 @@ async def admin_orders(
 
             elif order.status == "completed":
                 icon = "✅"
+
+            elif order.status == "preorder":
+                icon = "📦"
 
             else:
                 icon = "⏳"
@@ -161,7 +174,12 @@ async def order_info(
 
         delivered = (
             order.delivered_account
-            or "N/A"
+            or "Not delivered yet"
+        )
+
+        status_label = STATUS_LABELS.get(
+            order.status,
+            order.status
         )
 
         text = f"""
@@ -171,7 +189,7 @@ async def order_info(
 <code>{order.telegram_id}</code>
 
 📦 Product:
-{order.product_name}
+{order.product_name} x{order.quantity or 1}
 
 🔑 Delivered:
 <code>{delivered}</code>
@@ -180,7 +198,7 @@ async def order_info(
 ${float(order.amount):.2f}
 
 📄 Status:
-{order.status}
+{status_label}
 
 📅 Date:
 {order.created_at}
@@ -190,6 +208,23 @@ Refunded:
 """
 
         keyboard = []
+
+        needs_fulfillment = (
+            order.status in ("pending_manual", "preorder")
+            and not order.refunded
+        )
+
+        if needs_fulfillment:
+
+            keyboard.append(
+                [
+                    InlineKeyboardButton(
+                        text="📤 Deliver",
+                        callback_data=
+                        f"deliver_order_{order.id}"
+                    )
+                ]
+            )
 
         if not order.refunded:
 
@@ -384,3 +419,154 @@ async def delete_order(
     )
 
     await callback.answer()
+
+
+# ==========================================================
+# MANUAL DELIVERY (for "manual"/"hybrid" delivery type orders
+# and preorders — admin sends the account/key by hand)
+# ==========================================================
+
+@router.callback_query(
+    F.data.startswith(
+        "deliver_order_"
+    )
+)
+async def deliver_order_start(
+        callback: CallbackQuery,
+        state: FSMContext
+):
+
+    if not is_admin(
+            callback.from_user.id
+    ):
+        await callback.answer(
+            "Access denied.",
+            show_alert=True
+        )
+        return
+
+    order_id = int(
+        callback.data.split("_")[2]
+    )
+
+    await state.update_data(
+        deliver_order_id=order_id
+    )
+
+    await state.set_state(
+        DeliverOrder.content
+    )
+
+    await callback.message.answer(
+        "📤 Send the content to deliver to the buyer "
+        "(account, key, or any message).\n\n"
+        "It will be sent to them exactly as you type it, "
+        "and the order will be marked completed."
+    )
+
+    await callback.answer()
+
+
+@router.message(
+    DeliverOrder.content
+)
+async def deliver_order_finish(
+        message: Message,
+        state: FSMContext
+):
+
+    if not is_admin(
+            message.from_user.id
+    ):
+        return
+
+    data = await state.get_data()
+
+    order_id = data.get(
+        "deliver_order_id"
+    )
+
+    await state.clear()
+
+    if not order_id:
+        return
+
+    db = SessionLocal()
+
+    try:
+
+        order = (
+            db.query(Order)
+            .filter(
+                Order.id == order_id
+            )
+            .first()
+        )
+
+        if not order:
+
+            await message.answer(
+                "❌ Order not found."
+            )
+            return
+
+        if order.refunded:
+
+            await message.answer(
+                "❌ This order was already refunded, "
+                "not delivering it."
+            )
+            return
+
+        order.delivered_account = message.text
+        order.status = "completed"
+        order.is_preorder = False
+
+        db.commit()
+
+        buyer_id = order.telegram_id
+        product_name = order.product_name
+        delivered_text = message.text
+
+    finally:
+        db.close()
+
+    try:
+
+        await message.bot.send_message(
+            buyer_id,
+            "✅ Your order has been delivered!\n\n"
+            f"📦 Product:\n{product_name}\n\n"
+            "🔑 Details:\n\n"
+            f"<code>{delivered_text}</code>",
+            parse_mode="HTML"
+        )
+
+    except Exception as e:
+
+        print(
+            "DELIVER NOTIFY ERROR:",
+            e
+        )
+
+        await message.answer(
+            "⚠️ Order marked delivered, but I couldn't message the "
+            "buyer directly (they may have blocked the bot)."
+        )
+        return
+
+    await message.answer(
+        "✅ Delivered and buyer notified.",
+        reply_markup=
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="⬅ Back to Orders",
+                        callback_data=
+                        "admin_orders"
+                    )
+                ]
+            ]
+        )
+    )
