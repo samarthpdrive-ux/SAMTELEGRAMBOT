@@ -22,6 +22,8 @@ from keyboards.menu import get_admin_main_menu
 
 from states.broadcast import BroadcastState
 
+from utils.menu_tracker import replace_menu, track
+
 router = Router()
 
 
@@ -37,9 +39,12 @@ async def admin_cmd(
     if message.from_user.id not in ADMIN_IDS:
         return
 
-    await message.answer(
-        "👑 Admin Panel",
-        reply_markup=get_admin_panel()
+    await replace_menu(
+        bot=message.bot,
+        chat_id=message.chat.id,
+        telegram_id=message.from_user.id,
+        text="👑 Admin Panel",
+        keyboard=get_admin_panel()
     )
 
 
@@ -66,6 +71,12 @@ async def admin_panel(
     await callback.message.edit_text(
         "👑 Admin Panel",
         reply_markup=get_admin_panel()
+    )
+
+    track(
+        callback.from_user.id,
+        callback.message.chat.id,
+        callback.message.message_id
     )
 
     await callback.answer()
